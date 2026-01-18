@@ -1,0 +1,76 @@
+# Graph Kernel Service - Production Cloud Build Configuration
+# 
+# Deploys the Graph Kernel as a Cloud Run service with production settings.
+# Prerequisites:
+#   - kernel-hmac-secret: HMAC secret for token signing
+#   - database-url: PostgreSQL connection string
+
+steps:
+  # Build the Graph Kernel service with version tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args: 
+      - 'build'
+      - '--no-cache'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/graph-kernel:$SHORT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/graph-kernel:latest'
+      - '-f'
+      - 'Dockerfile.service'
+      - '--build-arg'
+      - 'BUILD_SHA=$SHORT_SHA'
+      - '.'
+
+  # Push both tags to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/graph-kernel:$SHORT_SHA']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/graph-kernel:latest']
+
+  # Deploy to Cloud Run with production settings
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'graph-kernel'
+      - '--image=gcr.io/$PROJECT_ID/graph-kernel:$SHORT_SHA'
+      - '--platform=managed'
+      - '--region=us-central1'
+      # Security: Require authentication (service-to-service)
+      - '--no-allow-unauthenticated'
+      # Port configuration
+      - '--port=8001'
+      # Resource limits - increased for large slices
+      - '--memory=1Gi'
+      - '--cpu=1'
+      # Scaling configuration
+      - '--min-instances=0'
+      - '--max-instances=10'
+      - '--concurrency=50'
+      # Timeout - 60s for slice generation
+      - '--timeout=60'
+      # Cost optimization - throttle CPU when idle
+      - '--cpu-throttling'
+      # Startup probe - boost CPU during startup for faster DB connection
+      - '--cpu-boost'
+      # Secrets from Secret Manager
+      - '--set-secrets=KERNEL_HMAC_SECRET=kernel-hmac-secret:latest,DATABASE_URL=database-url:latest'
+      # Environment variables
+      - '--set-env-vars=RUST_LOG=info,HOST=0.0.0.0,RUST_BACKTRACE=1'
+      # Labels for tracking
+      - '--labels=service=graph-kernel,component=authority-layer'
+      # Revision suffix for easier tracking
+      - '--revision-suffix=$SHORT_SHA'
+
+images:
+  - 'gcr.io/$PROJECT_ID/graph-kernel:$SHORT_SHA'
+  - 'gcr.io/$PROJECT_ID/graph-kernel:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  # Increase build timeout for Rust compilation
+  machineType: 'E2_HIGHCPU_8'
+
+timeout: '1800s'  # 30 minutes for Rust builds

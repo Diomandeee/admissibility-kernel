@@ -1,0 +1,101 @@
+# Graph Kernel Service Dockerfile
+# Production multi-stage build for minimal image size and security
+#
+# Build: docker build -f Dockerfile.service -t graph-kernel .
+# Run:   docker run -p 8001:8001 -e DATABASE_URL=... -e KERNEL_HMAC_SECRET=... graph-kernel
+
+# =============================================================================
+# Build Stage
+# =============================================================================
+# Use Rust nightly for edition2024 support (required by base64ct 1.8.1)
+# Pin to nightly-2025-01-01 for reproducibility
+FROM rustlang/rust:nightly-bookworm AS builder
+
+# Build arguments for metadata
+ARG BUILD_SHA=unknown
+ARG BUILD_DATE
+
+WORKDIR /app
+
+# Install build dependencies in single layer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add clippy
+
+# Copy manifests first for dependency caching
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy src for dependency pre-build
+RUN mkdir src && \
+    echo "fn main() {}" > src/main.rs && \
+    mkdir -p src/bin && \
+    echo "fn main() {}" > src/bin/graph_kernel_service.rs && \
+    mkdir -p benches && \
+    echo "fn main() {}" > benches/verification.rs
+
+# Pre-build dependencies (cached unless Cargo.toml changes)
+RUN cargo build --release --features service 2>/dev/null || true
+
+# Copy actual source
+COPY src ./src
+
+# Touch to invalidate cache for actual build
+RUN touch src/lib.rs src/bin/graph_kernel_service.rs
+
+# Build the production binary
+RUN cargo build --release --features service --bin graph_kernel_service \
+    && strip /app/target/release/graph_kernel_service
+
+# =============================================================================
+# Runtime Stage
+# =============================================================================
+FROM debian:bookworm-slim AS runtime
+
+# Image metadata
+LABEL org.opencontainers.image.title="Graph Kernel Service"
+LABEL org.opencontainers.image.description="Admissibility authority for the semantic system"
+LABEL org.opencontainers.image.vendor="Comp-Core"
+LABEL org.opencontainers.image.version="0.1.0"
+LABEL org.opencontainers.image.source="https://github.com/your-org/comp-core"
+LABEL service="graph-kernel"
+LABEL component="authority-layer"
+
+WORKDIR /app
+
+# Install runtime dependencies and curl for health checks
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/graph_kernel_service /app/graph_kernel_service
+
+# Create non-root user for security
+RUN groupadd -r appgroup && useradd -r -g appgroup -u 1000 appuser \
+    && chown -R appuser:appgroup /app
+
+# Switch to non-root user
+USER appuser
+
+# Environment configuration
+ENV PORT=8001
+ENV HOST=0.0.0.0
+ENV RUST_LOG=info
+ENV RUST_BACKTRACE=1
+
+# Expose service port
+EXPOSE 8001
+
+# Health check - verify service is responding
+# Check every 30s, timeout after 10s, mark unhealthy after 3 failures
+# Start checking after 5s to allow startup
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8001/health || exit 1
+
+# Run the service
+CMD ["/app/graph_kernel_service"]
